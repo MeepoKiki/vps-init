@@ -309,10 +309,10 @@ configure_time_and_guest() {
   fi
 
   if command -v systemctl >/dev/null 2>&1; then
-    if systemctl list-unit-files chronyd.service --no-legend 2>/dev/null | grep -q chronyd; then
-      service_enable_now chronyd
-    else
+    if [[ "$PKG_FAMILY" == apt ]]; then
       service_enable_now chrony || warn "chrony 服务未能启用"
+    else
+      service_enable_now chronyd || warn "chronyd 服务未能启用"
     fi
     service_enable_now qemu-guest-agent || warn "QEMU Guest Agent 未能启用，非 QEMU/KVM 环境可忽略"
     if systemctl list-unit-files fstrim.timer --no-legend 2>/dev/null | grep -q fstrim; then
