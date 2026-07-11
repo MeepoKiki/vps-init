@@ -7,12 +7,16 @@ ASSUME_YES=0
 FULL_UPGRADE=0
 ENABLE_FIREWALL=0
 ENABLE_BBR=0
+ENABLE_SWAP=0
+INSTALL_DOCKER=0
 HARDEN_SSH=0
 DISABLE_PASSWORD=0
 SSH_PORT=""
 TIMEZONE="Asia/Shanghai"
+SWAP_SIZE="auto"
 SSH_PORT_SET=0
 TIMEZONE_SET=0
+SWAP_SIZE_SET=0
 BACKUP_DIR="/root/vps-init-backup-$(date +%Y%m%d-%H%M%S)"
 
 log()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
@@ -40,6 +44,9 @@ usage() {
   --timezone ZONE       设置时区，默认 Asia/Shanghai
   --enable-firewall     启用防火墙，并先放行当前 SSH 端口
   --enable-bbr          系统支持时启用 BBR + fq
+  --enable-swap         创建 Swap；已存在活动 Swap 时不会重复创建
+  --swap-size SIZE      设置 Swap 容量，例如 512M、2G 或 auto；会自动启用 Swap
+  --install-docker      安装 Docker Engine 和 Compose，并启用 Docker 服务
   --harden-ssh          添加低风险 SSH 加固配置
   --disable-password    禁用 SSH 密码登录；必须同时使用 --harden-ssh，
                         且当前用户或 root 必须已有 authorized_keys
@@ -48,7 +55,8 @@ usage() {
 
 示例：
   sudo bash vps-init.sh
-  sudo bash vps-init.sh --yes --enable-firewall --enable-bbr
+  sudo bash vps-init.sh --yes --enable-firewall --enable-bbr --enable-swap
+  sudo bash vps-init.sh --yes --swap-size 2G --install-docker
   sudo bash vps-init.sh --ssh-port 2222 --harden-ssh
 EOF
 }
@@ -109,6 +117,24 @@ prompt_optional_features() {
   ask_enable "是否完整升级所有已安装软件包？" FULL_UPGRADE
   ask_enable "是否启用防火墙，并只预先放行当前 SSH 端口？" ENABLE_FIREWALL
   ask_enable "是否在内核支持时启用 BBR + fq？" ENABLE_BBR
+  ask_enable "是否创建 Swap（检测到已有活动 Swap 时会跳过）？" ENABLE_SWAP
+  if (( ENABLE_SWAP && ! SWAP_SIZE_SET )); then
+    local swap_reply
+    while true; do
+      read -r -p "请输入 Swap 容量，按 Enter 自动计算（例如 512M、2G）：" swap_reply
+      if [[ -z "$swap_reply" ]]; then
+        SWAP_SIZE="auto"
+        break
+      fi
+      swap_reply="${swap_reply^^}"
+      if [[ "$swap_reply" =~ ^[1-9][0-9]*[MG]$ ]]; then
+        SWAP_SIZE="$swap_reply"
+        break
+      fi
+      warn "Swap 容量格式无效，请使用 512M、2G 或直接按 Enter"
+    done
+  fi
+  ask_enable "是否安装 Docker Engine 和 Docker Compose？" INSTALL_DOCKER
   ask_enable "是否启用低风险 SSH 安全加固？" HARDEN_SSH
   if (( HARDEN_SSH )); then
     warn "禁用密码登录前，必须确保 SSH 密钥已经测试可用"
@@ -151,6 +177,8 @@ while (($#)); do
     --full-upgrade) FULL_UPGRADE=1 ;;
     --enable-firewall) ENABLE_FIREWALL=1 ;;
     --enable-bbr) ENABLE_BBR=1 ;;
+    --enable-swap) ENABLE_SWAP=1 ;;
+    --install-docker) INSTALL_DOCKER=1 ;;
     --harden-ssh) HARDEN_SSH=1 ;;
     --disable-password) DISABLE_PASSWORD=1 ;;
     --dry-run) DRY_RUN=1 ;;
@@ -161,6 +189,10 @@ while (($#)); do
     --timezone)
       (($# >= 2)) || die "--timezone 缺少时区"
       TIMEZONE="$2"; TIMEZONE_SET=1; shift
+      ;;
+    --swap-size)
+      (($# >= 2)) || die "--swap-size 缺少容量"
+      SWAP_SIZE="$2"; SWAP_SIZE_SET=1; ENABLE_SWAP=1; shift
       ;;
     -h|--help) usage; exit 0 ;;
     *) die "未知选项：$1（使用 --help 查看帮助）" ;;
@@ -174,6 +206,12 @@ if [[ -n "$SSH_PORT" ]]; then
   (( 10#$SSH_PORT >= 1 && 10#$SSH_PORT <= 65535 )) || die "SSH 端口范围必须是 1-65535"
 fi
 (( DISABLE_PASSWORD == 0 || HARDEN_SSH == 1 )) || die "--disable-password 必须配合 --harden-ssh"
+if [[ "${SWAP_SIZE,,}" == auto ]]; then
+  SWAP_SIZE="auto"
+else
+  SWAP_SIZE="${SWAP_SIZE^^}"
+  [[ "$SWAP_SIZE" =~ ^[1-9][0-9]*[MG]$ ]] || die "Swap 容量格式无效，请使用 512M、2G 或 auto"
+fi
 
 [[ -r /etc/os-release ]] || die "无法识别 Linux 发行版"
 # shellcheck disable=SC1091
@@ -366,6 +404,113 @@ net.ipv4.tcp_congestion_control = bbr"
   run sysctl --system
 }
 
+auto_swap_size() {
+  local mem_kib
+  mem_kib="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
+  if (( mem_kib <= 1048576 )); then
+    printf '1G'
+  elif (( mem_kib <= 2097152 )); then
+    printf '2G'
+  elif (( mem_kib <= 4194304 )); then
+    printf '2G'
+  else
+    printf '4G'
+  fi
+}
+
+configure_swap() {
+  (( ENABLE_SWAP )) || return 0
+  log "检查并配置 Swap"
+
+  if awk 'NR > 1 {found=1} END {exit !found}' /proc/swaps 2>/dev/null; then
+    warn "系统已经存在活动 Swap，不再重复创建"
+    cat /proc/swaps
+    return 0
+  fi
+
+  local size="$SWAP_SIZE"
+  [[ "$size" == auto ]] && size="$(auto_swap_size)"
+  log "将创建 ${size} 的 /swapfile"
+
+  if [[ -e /swapfile ]]; then
+    warn "/swapfile 已存在，尝试直接启用，不会覆盖现有文件"
+    run chmod 600 /swapfile
+    run swapon /swapfile || die "现有 /swapfile 无法启用，请手动检查后重试"
+  else
+    if (( DRY_RUN )); then
+      run fallocate -l "$size" /swapfile
+    else
+      local fs_type
+      fs_type="$(findmnt -no FSTYPE -T / 2>/dev/null || true)"
+      if [[ "$fs_type" == btrfs ]] && command -v chattr >/dev/null 2>&1; then
+        touch /swapfile
+        chattr +C /swapfile
+      fi
+      if ! fallocate -l "$size" /swapfile 2>/dev/null; then
+        local count_mib
+        if [[ "$size" == *G ]]; then
+          count_mib="$(( ${size%G} * 1024 ))"
+        else
+          count_mib="${size%M}"
+        fi
+        dd if=/dev/zero of=/swapfile bs=1M count="$count_mib" status=progress
+      fi
+    fi
+    run chmod 600 /swapfile
+    run mkswap /swapfile
+    run swapon /swapfile
+  fi
+
+  backup_file /etc/fstab
+  if ! grep -Eq '^[^#]+[[:space:]]+/swapfile[[:space:]]+swap[[:space:]]' /etc/fstab; then
+    if (( DRY_RUN )); then
+      printf '[dry-run] append to /etc/fstab: /swapfile none swap sw 0 0\n'
+    else
+      printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
+    fi
+  fi
+
+  local sysctl_file="/etc/sysctl.d/99-vps-init-swap.conf"
+  backup_file "$sysctl_file"
+  write_file "$sysctl_file" "vm.swappiness = 10
+vm.vfs_cache_pressure = 50"
+  run sysctl --system
+}
+
+install_docker() {
+  (( INSTALL_DOCKER )) || return 0
+  log "安装 Docker Engine 和 Docker Compose"
+
+  if command -v docker >/dev/null 2>&1; then
+    warn "检测到 Docker 已安装，将保留现有安装并确保服务已启用"
+  else
+    case "$PKG_FAMILY" in
+      apt|dnf|yum)
+        local docker_script="/tmp/get-docker.sh"
+        run curl -fsSL https://get.docker.com -o "$docker_script"
+        run sh "$docker_script"
+        (( DRY_RUN )) || rm -f "$docker_script"
+        ;;
+      zypper)
+        run zypper --non-interactive install docker docker-compose
+        ;;
+      pacman)
+        run pacman -S --needed --noconfirm docker docker-compose
+        ;;
+      apk)
+        run apk add docker docker-cli-compose
+        ;;
+      *) die "当前系统不支持自动安装 Docker" ;;
+    esac
+  fi
+
+  service_enable_now docker
+  if (( ! DRY_RUN )); then
+    docker --version || die "Docker 安装后无法运行"
+    docker compose version || warn "Docker Compose 插件不可用，请检查发行版软件包"
+  fi
+}
+
 has_authorized_key() {
   local invoking_user="${SUDO_USER:-root}" home_dir="/root"
   if [[ "$invoking_user" != root ]]; then
@@ -441,9 +586,12 @@ log "时区：$TIMEZONE"
 log "完整升级：$([[ $FULL_UPGRADE -eq 1 ]] && echo 开启 || echo 关闭)"
 log "防火墙：$([[ $ENABLE_FIREWALL -eq 1 ]] && echo 开启 || echo 关闭)"
 log "BBR：$([[ $ENABLE_BBR -eq 1 ]] && echo 开启 || echo 关闭)"
+log "Swap：$([[ $ENABLE_SWAP -eq 1 ]] && echo "开启（$SWAP_SIZE）" || echo 关闭)"
+log "Docker：$([[ $INSTALL_DOCKER -eq 1 ]] && echo 安装 || echo 不安装)"
 log "SSH 加固：$([[ $HARDEN_SSH -eq 1 ]] && echo 开启 || echo 关闭)"
 log "禁用 SSH 密码登录：$([[ $DISABLE_PASSWORD -eq 1 ]] && echo 开启 || echo 关闭)"
 (( ENABLE_FIREWALL )) && warn "将启用防火墙；脚本会先放行 TCP/$SSH_PORT"
+(( INSTALL_DOCKER && ENABLE_FIREWALL )) && warn "Docker 发布的容器端口可能绕过 UFW 入站规则，请只发布必要端口"
 (( DISABLE_PASSWORD )) && warn "将禁用 SSH 密码登录，请确认密钥登录已经验证成功"
 confirm
 
@@ -452,13 +600,17 @@ configure_time_and_guest
 configure_fail2ban
 configure_firewall
 configure_bbr
+configure_swap
+install_docker
 configure_ssh
 
 log "初始化完成"
 printf '\n系统：%s\nSSH 端口：%s\nFail2ban：已配置 sshd jail\n' "${PRETTY_NAME:-$OS_ID}" "$SSH_PORT"
-printf '防火墙：%s\nBBR：%s\nSSH 加固：%s\n' \
+printf '防火墙：%s\nBBR：%s\nSwap：%s\nDocker：%s\nSSH 加固：%s\n' \
   "$([[ $ENABLE_FIREWALL -eq 1 ]] && echo 已启用 || echo 未改动)" \
   "$([[ $ENABLE_BBR -eq 1 ]] && echo 已请求启用 || echo 未改动)" \
+  "$([[ $ENABLE_SWAP -eq 1 ]] && echo 已检查并配置 || echo 未改动)" \
+  "$([[ $INSTALL_DOCKER -eq 1 ]] && echo 已检查并安装 || echo 未改动)" \
   "$([[ $HARDEN_SSH -eq 1 ]] && echo 已配置 || echo 未改动)"
 (( DRY_RUN )) || printf '备份目录：%s\n' "$BACKUP_DIR"
-printf '\n检查命令：\n  fail2ban-client status sshd\n  ss -lntp\n  systemctl --failed\n'
+printf '\n检查命令：\n  fail2ban-client status sshd\n  swapon --show\n  docker version\n  ss -lntp\n  systemctl --failed\n'
